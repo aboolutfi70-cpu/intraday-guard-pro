@@ -1,1 +1,364 @@
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import yfinance as yf
+import pandas as pd
+from datetime import datetime
+import math
+
+app = FastAPI(
+    title="INTRADAY GUARD PRO API",
+    description="Intraday Stock Analysis Backend",
+    version="4.0"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --------------------------------------------------
+# ROOT
+# --------------------------------------------------
+
+@app.get("/")
+def home():
+    return {
+        "app": "INTRADAY GUARD PRO",
+        "status": "LIVE",
+        "version": "V4",
+        "message": "Backend is running"
+    }
+
+
+# --------------------------------------------------
+# CHART DATA
+# --------------------------------------------------
+
+@app.get("/api/chart/{symbol}")
+def get_chart(symbol: str):
+
+    try:
+        ticker = yf.Ticker(symbol)
+
+        df = ticker.history(
+            period="5d",
+            interval="15m",
+            auto_adjust=False
+        )
+
+        if df.empty:
+            raise HTTPException(
+                status_code=404,
+                detail="No chart data found"
+            )
+
+        df = df.dropna(subset=["Open", "High", "Low", "Close"])
+
+        chart_data = []
+
+        for index, row in df.iterrows():
+
+            timestamp = int(index.timestamp())
+
+            chart_data.append({
+                "time": timestamp,
+                "open": round(float(row["Open"]), 2),
+                "high": round(float(row["High"]), 2),
+                "low": round(float(row["Low"]), 2),
+                "close": round(float(row["Close"]), 2),
+                "volume": int(row["Volume"])
+            })
+
+        chart_data = chart_data[-100:]
+
+        live_price = chart_data[-1]["close"]
+
+        previous_close = None
+
+        try:
+            info = ticker.info
+            previous_close = info.get("previousClose")
+        except Exception:
+            previous_close = None
+
+        if not previous_close:
+            daily = ticker.history(period="5d", interval="1d")
+
+            if len(daily) >= 2:
+                previous_close = float(daily["Close"].iloc[-2])
+
+        if previous_close and previous_close > 0:
+            prev_day_pct = (
+                (live_price - previous_close)
+                / previous_close
+            ) * 100
+        else:
+            prev_day_pct = 0
+
+        avg_volume = float(df["Volume"].tail(20).mean())
+
+        return {
+            "symbol": symbol,
+            "chart": chart_data,
+            "livePrice": round(live_price, 2),
+            "previousClose": previous_close,
+            "prevDayPct": round(prev_day_pct, 2),
+            "averageVolume": round(avg_volume, 2),
+            "dataSource": "Yahoo Finance",
+            "timestamp": datetime.now().isoformat()
+        }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+
+# --------------------------------------------------
+# FUNDAMENTAL DATA
+# --------------------------------------------------
+
+@app.get("/api/fundamental/{symbol}")
+def get_fundamental(symbol: str):
+
+    try:
+        info = yf.Ticker(symbol).info
+
+        profit_margin = info.get("profitMargins")
+        debt_equity = info.get("debtToEquity")
+        insider_holding = info.get("heldPercentInsiders")
+
+        score = 5
+
+        if profit_margin is not None:
+            score += 2 if profit_margin > 0 else -2
+
+        if debt_equity is not None:
+            score += 1 if debt_equity < 100 else -1
+
+        if insider_holding is not None:
+            score += 1 if insider_holding > 0.05 else 0
+
+        score = max(1, min(10, score))
+
+        if score >= 7:
+            result = "GOOD"
+        elif score >= 4:
+            result = "AVERAGE"
+        else:
+            result = "WEAK"
+
+        return {
+            "symbol": symbol,
+            "fundamentalScore": score,
+            "qResult": result,
+            "profitMargins": profit_margin,
+            "debtToEquity": debt_equity,
+            "insiderHolding": insider_holding,
+            "dataSource": "Yahoo Finance"
+        }
+
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "fundamentalScore": 0,
+            "qResult": "DATA UNAVAILABLE",
+            "error": str(e)
+        }
+
+
+# --------------------------------------------------
+# NEWS SENTIMENT
+# --------------------------------------------------
+
+@app.get("/api/news/{symbol}")
+def get_news(symbol: str):
+
+    try:
+        news_items = yf.Ticker(symbol).news[:5]
+
+        positive_words = [
+            "growth", "profit", "surge", "upgrade",
+            "strong", "record", "gain", "positive",
+            "beat", "bullish"
+        ]
+
+        negative_words = [
+            "loss", "fall", "drop", "downgrade",
+            "weak", "decline", "negative", "bearish",
+            "miss", "crash"
+        ]
+
+        positive_count = 0
+        negative_count = 0
+        headlines = []
+
+        for item in news_items:
+
+            content = item.get("content", item)
+
+            title = content.get("title", "")
+
+            headlines.append(title)
+
+            text = title.lower()
+
+            positive_count += sum(
+                word in text for word in positive_words
+            )
+
+            negative_count += sum(
+                word in text for word in negative_words
+            )
+
+        if positive_count > negative_count:
+            sentiment = "POSITIVE"
+        elif negative_count > positive_count:
+            sentiment = "NEGATIVE"
+        else:
+            sentiment = "NEUTRAL"
+
+        return {
+            "symbol": symbol,
+            "newsSentiment": sentiment,
+            "positiveCount": positive_count,
+            "negativeCount": negative_count,
+            "headlines": headlines,
+            "dataSource": "Yahoo Finance"
+        }
+
+    except Exception as e:
+        return {
+            "symbol": symbol,
+            "newsSentiment": "UNAVAILABLE",
+            "headlines": [],
+            "error": str(e)
+        }
+
+
+# --------------------------------------------------
+# FINAL SCORE ENGINE
+# --------------------------------------------------
+
+@app.get("/api/final-score/{symbol}")
+def get_final_score(symbol: str):
+
+    chart = get_chart(symbol)
+    fundamental = get_fundamental(symbol)
+    news = get_news(symbol)
+
+    candles = chart.get("chart", [])
+
+    if not candles:
+        raise HTTPException(
+            status_code=404,
+            detail="Chart unavailable"
+        )
+
+    last = candles[-1]
+
+    score = 50
+    reasons = []
+
+    # FILTER 1: Previous Day Trend
+    prev_day_pct = chart.get("prevDayPct", 0)
+
+    if prev_day_pct > 1:
+        score += 10
+        reasons.append("Positive Previous Day Trend")
+
+    elif prev_day_pct < -2:
+        score -= 15
+        reasons.append("Negative Previous Day Trend")
+
+    # FILTER 2: Fundamental
+    fscore = fundamental.get("fundamentalScore", 0)
+
+    if fscore >= 7:
+        score += 10
+        reasons.append("Strong Fundamental")
+
+    elif fscore <= 3:
+        score -= 10
+        reasons.append("Weak Fundamental")
+
+    # FILTER 3: News
+    sentiment = news.get("newsSentiment")
+
+    if sentiment == "POSITIVE":
+        score += 8
+        reasons.append("Positive News")
+
+    elif sentiment == "NEGATIVE":
+        score -= 12
+        reasons.append("Negative News")
+
+    # FILTER 4: Candle Structure
+    candle_range = last["high"] - last["low"]
+
+    if candle_range > 0:
+
+        upper_wick = (
+            last["high"]
+            - max(last["open"], last["close"])
+        )
+
+        upper_wick_pct = upper_wick / candle_range
+
+        if upper_wick_pct > 0.50:
+            score -= 10
+            reasons.append("Strong Upper Wick")
+
+    # FILTER 5: Volume Confirmation
+    avg_volume = chart.get("averageVolume", 0)
+    current_volume = last.get("volume", 0)
+
+    if avg_volume > 0:
+
+        if current_volume > avg_volume * 1.5:
+            score += 10
+            reasons.append("Volume Confirmation")
+
+        elif current_volume < avg_volume * 0.5:
+            score -= 5
+            reasons.append("Weak Volume")
+
+    # Final score
+    score = max(5, min(95, score))
+
+    if score >= 75:
+        verdict = "BUY WATCH"
+        color = "GREEN"
+
+    elif score <= 35:
+        verdict = "EXIT / AVOID"
+        color = "RED"
+
+    else:
+        verdict = "WAIT"
+        color = "YELLOW"
+
+    return {
+        "symbol": symbol,
+        "liveScore": score,
+        "verdict": verdict,
+        "color": color,
+        "reasons": reasons,
+        "details": {
+            "chart": chart,
+            "fundamental": fundamental,
+            "news": news
+        },
+        "timestamp": datetime.now().isoformat(),
+        "warning": "Educational score only. Not a guaranteed trading signal."
+    }
+
